@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""ledger-append approvals|revocations key=value ...   Append-only; adds ts. Validates required keys.
+  approvals:   id type(send|spend|delete|loosen|push) scope approved_by quote ref
+  revocations: agent revoked mechanism evidence
+Never edit a row: to correct one, append a new row with supersedes=<id>."""
+import datetime, json, os, sys
+REQ = {"approvals": ["id", "type", "scope", "approved_by", "quote", "ref"], "revocations": ["agent", "revoked", "mechanism", "evidence"]}
+if len(sys.argv) < 3 or sys.argv[1] not in REQ: print(__doc__); sys.exit(2)
+r = {"ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}; r.update(dict(x.split("=", 1) for x in sys.argv[2:]))
+miss = [k for k in REQ[sys.argv[1]] if not r.get(k)]
+if miss: print("refused: missing", miss); sys.exit(2)
+D = os.environ.get("GATE_DIR", "ledgers"); os.makedirs(D, exist_ok=True)
+open(os.path.join(D, sys.argv[1] + ".jsonl"), "a").write(json.dumps(r) + "\n"); print(json.dumps(r))

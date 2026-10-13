@@ -1,0 +1,17 @@
+{
+  "tiers": {
+    "0": "no tools",
+    "1": "read: search, list, get, fetch",
+    "2": "reversible write in the role's own area: drafts, notes, files it owns, labels",
+    "3": "irreversible or external: send, post, spend, delete, share, loosen, merge, push, deploy. Needs a named human yes every time."
+  },
+  "classify": {
+    "3": "(send|post|reply|forward|publish|broadcast|merge|push|deploy|delete|trash|remove|cancel|share|purchase|pay|spend|refund|transfer|grant|permission|invite)",
+    "2": "(create|update|write|save|upload|label|draft|edit|copy|move|rename|set|add|mark|apply|pause)"
+  },
+  "overrides": {
+    "shell": 2,
+    "browser": 2
+  },
+  "enforcement_note": "Say honestly which tiers are technically enforced (approval prompts, scoped tokens) and which are policy + audit only."
+}

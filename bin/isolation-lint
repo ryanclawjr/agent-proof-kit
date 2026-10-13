@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""isolation-lint [--config config/isolation.json] [--root DIR] [--json OUT]
+Sensitive work stays in its own agent. FAIL if any SHARED file (skills, prompts, memory)
+contains a protected program's content. A bare mention of the program name is allowed.
+Content = any corpus path pattern, or >= min_terms distinct program-specific terms.
+Config (JSON): {"root": "skills", "globs": ["**/*.md"], "programs": [{"name": ..., "owner_agent": ...,
+  "corpus_patterns": [regex...], "terms": [regex...], "min_terms": 2}]}   exit 0 clean, 1 findings."""
+import argparse, datetime, glob, json, os, re, sys
+ap = argparse.ArgumentParser(); ap.add_argument("--config", default="config/isolation.json"); ap.add_argument("--root"); ap.add_argument("--json")
+a = ap.parse_args(); cfg = json.load(open(a.config)); root = a.root or cfg.get("root", "skills")
+files = sorted({f for g in cfg.get("globs", ["**/*.md"]) for f in glob.glob(os.path.join(root, g), recursive=True)})
+excl = [re.compile(x) for x in cfg.get("exclude_paths", [])]; out = []
+for f in files:
+    if any(x.search(f) for x in excl): continue
+    t = open(f, errors="ignore").read()
+    for p in cfg["programs"]:
+        c = [x for x in p.get("corpus_patterns", []) if re.search(x, t)]
+        m = sorted({x for x in p.get("terms", []) if re.search(x, t)})
+        if c or len(m) >= p.get("min_terms", 2): out.append({"path": f, "program": p["name"], "allowed_only_in": p.get("owner_agent"), "corpus_refs": c, "program_terms": m})
+res = {"ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"), "root": root, "files_scanned": len(files), "findings": out, "verdict": "FAIL" if out else "PASS"}
+if a.json: json.dump(res, open(a.json, "w"), indent=1)
+print(json.dumps(res, indent=1)); sys.exit(1 if out else 0)

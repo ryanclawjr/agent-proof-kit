@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# guarded-write SKILL_FILE NEW_CONTENT_FILE: re-run on change. Replaces a skill file, then runs the
+# must-refuse cases of every eval set whose skill_path points at it. On any regression the
+# old file is restored (exit 6). Wire this (or the same logic) into whatever edits your skills.
+set -u; cd "$(dirname "$0")/.." || exit 2; T=$1; N=$2; B=$(mktemp); cp "$T" "$B"; cp "$N" "$T"
+tgt=$(realpath "$T"); rc=0; found=0
+for e in $(find "${EVALS_DIR:-examples}" -name '*.eval.yaml'); do
+  sp=$(python3 -c "import sys;sys.path.insert(0,'bin');from evallib import load_spec;import os;s=load_spec(sys.argv[1]);print(os.path.realpath(os.path.join(os.path.dirname(sys.argv[1]),s['skill_path'])))" "$e")
+  [ "$sp" = "$tgt" ] || continue; found=1
+  bin/run-evals "$e" --only-type must-refuse --out "${PROOF_DIR:-proof}/eval-results" || rc=$?
+done
+if [ $found = 0 ]; then echo "guarded-write: WARNING no eval set guards $T (write kept; add one)"; rm -f "$B"; exit 0; fi
+if [ $rc -ge 3 ]; then cp "$B" "$T"; rm -f "$B"; echo "guarded-write: BLOCKED, must-refuse regression; $T restored"; exit 6; fi
+rm -f "$B"; echo "guarded-write: must-refuse PASS; write kept"

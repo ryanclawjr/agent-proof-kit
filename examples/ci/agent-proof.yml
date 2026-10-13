@@ -1,0 +1,36 @@
+name: agent-proof
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 6 * * *"   # nightly re-run
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Self-test the kit
+        run: ./tests/run.sh
+      - name: Evals (must-refuse, past-failure, planted bad answers)
+        # Swap in your real agent and judge via repository secrets/vars, e.g.
+        # AGENT_CMD: ${{ vars.AGENT_CMD }}   JUDGE_CMD: ${{ vars.JUDGE_CMD }}
+        run: |
+          ./bin/run-evals examples --out proof/eval-results
+          ./bin/judge-check examples
+      - name: Secret scan (full git history)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: config/secret-scan.toml
+      - name: Isolation lint
+        run: ./bin/isolation-lint
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: proof
+          path: proof/

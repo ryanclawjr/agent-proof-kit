@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# nightly-checks: one regenerable proof run. Schedule it (cron, CI schedule, or your agent scheduler).
+# Writes ${PROOF_DIR:-proof}/nightly/<date>.json. Exit nonzero if any check fails.
+# Edit CHECKS to point at your own skills/evals/roles.
+cd "$(dirname "$0")/.." || exit 2
+P=${PROOF_DIR:-proof}; D=$(date +%F); O=$P/nightly; mkdir -p "$O"; L=$O/$D.log; : > "$L"; declare -A R
+run(){ n=$1; shift; echo "== $n: $*" >> "$L"; "$@" >> "$L" 2>&1; R[$n]=$?; echo "$n -> ${R[$n]}"; }
+run evals        bin/run-evals "${EVALS_DIR:-examples}" --out "$P/eval-results"
+run judge_check  bin/judge-check "${EVALS_DIR:-examples}"
+run secret_scan  bin/secret-scan .
+run isolation    bin/isolation-lint --json "$P/isolation-$D.json"
+run gate_check   bin/gate-clear check
+run tool_tiers   bin/tool-tiers-gen --out "$P/tool-tiers.json"
+python3 - "$O/$D.json" "$L" "$D" $(for k in "${!R[@]}"; do echo "$k=${R[$k]}"; done) <<'PY'
+import json,sys; out,log,d=sys.argv[1:4]; r={k:int(v) for k,v in (a.split("=") for a in sys.argv[4:])}
+doc={"date":d,"results":r,"log":log,"verdict":"PASS" if all(v==0 for v in r.values()) else "FAIL"}; json.dump(doc,open(out,"w"),indent=1); print(json.dumps(doc))
+PY
+for v in "${R[@]}"; do [ "$v" = 0 ] || exit 1; done

@@ -1,0 +1,15 @@
+{
+  "_comment": "Example: a confidential client program whose content must stay inside one agent. Replace names/terms with yours.",
+  "root": "examples/skills",
+  "globs": ["**/*.md", "**/*.yaml"],
+  "exclude_paths": [],
+  "programs": [
+    {
+      "name": "Project Falcon",
+      "owner_agent": "falcon-agent",
+      "corpus_patterns": ["clients/falcon/", "FALCON_CONFIDENTIAL"],
+      "terms": ["\\bFalcon ledger\\b", "\\bFLC-\\d+\\b", "\\bphase gate 3\\b", "\\bAcme Holdings\\b"],
+      "min_terms": 2
+    }
+  ]
+}

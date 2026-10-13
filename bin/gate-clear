@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""gate-clear: the only sanctioned way to pause or clear a lane (a stream of work that ships).
+A failed audit pauses the lane; nothing ships from a paused lane; clearing is logged.
+
+  gate-clear pause LANE --by auditor --reason "audit row / why"
+  gate-clear clear LANE --by auditor --verdict-file FILE --reaudit FILE
+                   [--approved-by NAME --quote "exact words" --quote-ref WHERE]
+  gate-clear status [LANE]   # exit 1 if LANE (or any lane) is paused  -> use in your ship step
+  gate-clear check           # exit 1 if any pause has no matching clear row and is no longer paused
+
+Rules: only the auditor role (GATE_AUDITOR, default "auditor") clears. A REPEAT failure
+(lane cleared in the last 7 days, or paused 2+ times in 24h) also needs a named human
+from GATE_APPROVERS (comma list, default "owner") with their exact quote and where it was said.
+Ledgers live in GATE_DIR (default ./ledgers): pauses.jsonl, clears.jsonl, <lane>.paused.
+Exit 2 = refused."""
+import argparse, datetime, hashlib, json, os, sys
+D = os.environ.get("GATE_DIR", "ledgers"); AUD = os.environ.get("GATE_AUDITOR", "auditor")
+APPROVERS = [x.strip() for x in os.environ.get("GATE_APPROVERS", "owner").split(",")]
+now = datetime.datetime.now().astimezone(); iso = lambda t: t.isoformat(timespec="seconds"); ts = datetime.datetime.fromisoformat
+def rows(n):
+    try: return [json.loads(l) for l in open(os.path.join(D, n)) if l.strip()]
+    except FileNotFoundError: return []
+def append(n, r):
+    os.makedirs(D, exist_ok=True)
+    with open(os.path.join(D, n), "a") as f: f.write(json.dumps(r) + "\n")
+def refuse(m): print("refused:", m); sys.exit(2)
+ap = argparse.ArgumentParser(); ap.add_argument("cmd", choices=["pause", "clear", "status", "check"]); ap.add_argument("lane", nargs="?")
+for o in ("--by", "--reason", "--verdict-file", "--reaudit", "--approved-by", "--quote", "--quote-ref"): ap.add_argument(o)
+a = ap.parse_args(); pf = lambda l: os.path.join(D, f"{l}.paused")
+if a.cmd == "pause":
+    if not a.lane or not a.reason: refuse("pause needs LANE and --reason")
+    r = {"lane": a.lane, "paused_at": iso(now), "paused_by": a.by, "reason": a.reason}
+    os.makedirs(D, exist_ok=True); open(pf(a.lane), "w").write(json.dumps(r) + "\n"); append("pauses.jsonl", r); print("PAUSED", json.dumps(r)); sys.exit(0)
+if a.cmd == "status":
+    lanes = [a.lane] if a.lane else [f[:-7] for f in os.listdir(D) if f.endswith(".paused")] if os.path.isdir(D) else []
+    p = [l for l in lanes if os.path.exists(pf(l))]; print("paused:", p or "none"); sys.exit(1 if p else 0)
+if a.cmd == "check":
+    clears = rows("clears.jsonl"); bad = []
+    for p in rows("pauses.jsonl"):
+        t = ts(p["paused_at"])
+        if not os.path.exists(pf(p["lane"])) and not any(c["lane"] == p["lane"] and ts(c["paused_at"]) <= t + datetime.timedelta(minutes=5) and ts(c["cleared_at"]) >= t for c in clears):
+            bad.append(p)
+    print(json.dumps({"ts": iso(now), "pauses": len(rows("pauses.jsonl")), "unrecorded_clears": bad}, indent=1)); sys.exit(1 if bad else 0)
+# clear
+if a.by != AUD: refuse(f"only --by {AUD} may clear a lane (builders never clear their own pause)")
+if not os.path.exists(pf(a.lane or "")): refuse(f"lane {a.lane!r} is not paused")
+for f in (a.verdict_file, a.reaudit):
+    if not f or not os.path.exists(f.split("#")[0]): refuse(f"verdict/reaudit file missing: {f}")
+pauses = [ts(p["paused_at"]) for p in rows("pauses.jsonl") if p["lane"] == a.lane]
+paused_at = max(pauses) if pauses else datetime.datetime.fromtimestamp(os.path.getmtime(pf(a.lane))).astimezone()
+recent = [c for c in rows("clears.jsonl") if c["lane"] == a.lane and now - ts(c["cleared_at"]) < datetime.timedelta(days=7)]
+repeat = bool(recent) or len([p for p in pauses if now - p < datetime.timedelta(hours=24)]) >= 2
+if repeat and not (a.approved_by in APPROVERS and a.quote and a.quote_ref):
+    refuse(f"repeat failure on {a.lane}: needs --approved-by one of {APPROVERS} plus --quote and --quote-ref")
+r = {"lane": a.lane, "paused_at": iso(paused_at), "pause_sha256": hashlib.sha256(open(pf(a.lane), "rb").read()).hexdigest(),
+     "cleared_at": iso(now), "cleared_by": a.by, "verdict_file": a.verdict_file, "reaudit_pass": a.reaudit,
+     "repeat_failure": repeat, "approved_by": a.approved_by, "quote": a.quote, "quote_ref": a.quote_ref}
+append("clears.jsonl", r); os.remove(pf(a.lane)); print("CLEARED", json.dumps(r))

@@ -1,0 +1,5 @@
+results/
+proof/
+ledgers/*.jsonl
+ledgers/*.paused
+__pycache__/

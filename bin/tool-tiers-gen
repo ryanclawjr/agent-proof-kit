@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+"""tool-tiers-gen [--profiles roles/] [--calls calls.jsonl] [--out proof/tool-tiers.json]
+Builds the least-access report: for each role profile, the tools it was OBSERVED calling,
+each tool's tier, and whether it exceeded its tier_max. Exit 1 if any role exceeded tier_max.
+  Tier 1 read | Tier 2 reversible write in its own area | Tier 3 send/spend/delete/loosen/merge/push/deploy
+calls.jsonl rows: {"ts": ..., "role": ..., "tool": ...}  (export from your agent harness logs).
+Rules come from templates/tool-tiers.json (override with --tiers)."""
+import argparse, collections, datetime, glob, json, os, re, sys
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+from evallib import load_spec
+ap = argparse.ArgumentParser(); ap.add_argument("--profiles", default="examples/roles"); ap.add_argument("--calls", default="examples/calls.jsonl")
+ap.add_argument("--tiers", default=os.path.join(HERE, "..", "templates", "tool-tiers.json")); ap.add_argument("--out", default="proof/tool-tiers.json")
+a = ap.parse_args(); T = json.load(open(a.tiers))
+rx = {int(k): re.compile(v, re.I) for k, v in T["classify"].items()}
+def tier(tool):
+    if tool in T.get("overrides", {}): return T["overrides"][tool]
+    for k in sorted(rx, reverse=True):
+        if rx[k].search(tool): return k
+    return 1
+calls = collections.defaultdict(collections.Counter)
+if os.path.exists(a.calls):
+    for l in open(a.calls):
+        if l.strip(): d = json.loads(l); calls[d["role"]][d["tool"]] += 1
+out = {"generated": datetime.datetime.now().astimezone().isoformat(timespec="seconds"), "tiers": T["tiers"], "roles": {}}; over = []
+for f in sorted(glob.glob(os.path.join(a.profiles, "*.yaml"))):
+    p = load_spec(f); name = p["role"]; tools = {t: {"tier": tier(t), "calls": n} for t, n in calls[name].items()}
+    mx = max([v["tier"] for v in tools.values()] or [0])
+    if mx > p.get("tier_max", 1): over.append(name)
+    out["roles"][name] = {"tier_max": p.get("tier_max"), "max_tier_observed": mx, "exceeded": mx > p.get("tier_max", 1), "tools": tools, "may_not": p.get("may_not", [])}
+os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True); json.dump(out, open(a.out, "w"), indent=1)
+print(json.dumps({r: {k: v[k] for k in ("tier_max", "max_tier_observed", "exceeded")} for r, v in out["roles"].items()}, indent=1), "->", a.out)
+sys.exit(1 if over else 0)
