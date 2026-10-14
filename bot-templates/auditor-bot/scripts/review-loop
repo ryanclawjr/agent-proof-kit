@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""review-loop: pre-merge AI review loop for coding lanes.
+
+  review-loop round  --lane L --ref PR --repo DIR --base REF --brief FILE
+                     --builder-model M --reviewer SPEC [--canary --same-family-ok]
+  review-loop status --lane L --ref PR [--head-sha SHA]
+  review-loop verdict --lane L --ref PR --head-sha SHA     # exit 0 only if mergeable
+
+Rules (each is enforced here, not just documented):
+  * Reviewer family must differ from the builder family (xai/anthropic/openai/google).
+    Unknown family or same family -> refused (exit 2). --same-family-ok is accepted ONLY
+    with --canary and marks the loop canary:true, which ship-log and verdict reject.
+  * Max 3 rounds. A 4th round is refused (exit 4): open comments go to the lane PM.
+  * Every round starts the reviewer as a NEW process (fresh context) on the FULL diff
+    base...HEAD of the repo, plus the written planning brief. No earlier round is shown.
+  * The reviewer must return JSON {checklist:[{item,status:PASS|FAIL,evidence}],
+    comments:[{severity:blocking|nonblocking,file,line,text}]}. Unparseable output,
+    or an empty checklist (even with zero comments), is a FAIL round.
+  * A comment is resolved only when a later fresh round does not raise it again. There
+    is no resolve command; the builder cannot resolve anything.
+  * Round PASS = checklist non-empty, every checklist item PASS, zero blocking comments.
+  * Raw reviewer output, prompt sha, diff sha and head sha of every round are saved
+    through safe-write under $REVIEW_LOOP_ROOT/<lane>-<ref>/ so ship-log can cite them.
+Reviewer SPEC: grok:<model> | claude:<model> (claude CLI) | codex:<model> | cmd:<shell cmd reading prompt on stdin>
+Exit: 0 PASS round / mergeable, 1 FAIL round / not mergeable, 2 refused, 3 cannot run, 4 round cap -> lane PM."""
+import argparse, hashlib, json, os, re, subprocess, sys, tempfile, datetime, difflib
+HOME = os.environ.get("BOT_HOME", os.path.expanduser("~/bot-data"))
+ROOT = os.environ.get("REVIEW_LOOP_ROOT", os.path.join(HOME, "review-loops"))
+RESTRICTED = [t.strip().casefold() for t in os.environ.get("RESTRICTED_TERMS", "").split(",") if t.strip()]
+SW = os.environ.get("SAFE_WRITE_BIN", "safe-write")
+GROK = os.environ.get("GROK_BIN", "grok")
+MAX_ROUNDS = 3
+NOTOOLS = "run_terminal_command,read_file,search_replace,list_dir,grep,kill_command_or_subagent,todo_write,get_command_or_subagent_output,spawn_subagent,scheduler_create,scheduler_delete,scheduler_list,monitor,search_tool,use_tool,workflow,enter_plan_mode,exit_plan_mode,ask_user_question,send_feedback,image_gen,image_edit,image_to_video,reference_to_video,write"
+
+def family(model):
+    m = (model or "").lower()
+    for fam, keys in (("xai", ("grok",)), ("anthropic", ("claude", "opus", "sonnet", "haiku")),
+                      ("openai", ("gpt", "codex", "o3", "o4")), ("google", ("gemini",))):
+        if any(k in m for k in keys): return fam
+    return None
+
+def now(): return datetime.datetime.now().astimezone()
+def sha(b): return hashlib.sha256(b if isinstance(b, bytes) else b.encode()).hexdigest()
+def die(msg, code): print("review-loop: " + msg, file=sys.stderr); sys.exit(code)
+
+def swrite(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    cur = subprocess.run([SW, "--sha", path], capture_output=True, text=True).stdout.strip().split()[-1]
+    r = subprocess.run([SW, path, "--expect-sha", cur, "--agent", os.environ.get("REVIEW_LOOP_AGENT", "reviewer")],
+                       input=data.encode(), capture_output=True)
+    if r.returncode != 0: die("safe-write failed for %s: %s" % (path, (r.stdout + r.stderr).decode()[-300:]), 3)
+
+def loopdir(lane, ref): return os.path.join(ROOT, "%s-%s" % (lane, re.sub(r"[^\w.-]", "_", str(ref))))
+def rounds(d):
+    p = os.path.join(d, "loop.jsonl")
+    return [json.loads(l) for l in open(p) if l.strip()] if os.path.isfile(p) else []
+
+PROMPT = """You are an independent code reviewer in a FRESH context. You have not seen any earlier review.
+Review the FULL diff below (base...head) against the WRITTEN BRIEF. Be adversarial: look for bugs, wrong
+behaviour versus the brief, missing tests, security problems, and scope creep.
+
+Return ONLY JSON, no prose, in exactly this shape:
+{"checklist":[{"item":"<one requirement taken from the brief>","status":"PASS|FAIL","evidence":"<file:line or reason>"}],
+ "comments":[{"severity":"blocking|nonblocking","file":"<path>","line":<int or null>,"text":"<problem and fix>"}]}
+Rules: one checklist item per requirement in the brief (at least one), PLUS always this house item, worded exactly:
+"[hygiene] No new comment justifying a shortcut, skip, default or workaround; no new TODO/HACK/FIXME or lint/type suppression without an issue link"
+Mark it FAIL if the diff ADDS such a comment or suppression (comments explaining why a security check or rule holds, license
+headers and API docs are fine). Do not copy or excuse existing workaround comments. Mark FAIL when the diff does not meet it.
+Any bug, brief violation or security problem is "blocking". Style nits are "nonblocking".
+
+=== WRITTEN BRIEF ===
+{brief}
+=== END BRIEF ===
+
+=== FULL DIFF ({base}...{head}) ===
+{diff}
+=== END DIFF ==="""
+
+def call_reviewer(spec, prompt):
+    kind, _, arg = spec.partition(":")
+    with tempfile.TemporaryDirectory(prefix="review-") as d:   # fresh process, empty cwd = fresh context
+        if kind == "grok":
+            cmd = [GROK, "-p", prompt, "-m", arg, "--disallowed-tools", NOTOOLS, "--disable-web-search", "--cwd", d]; inp = None
+        elif kind == "claude":
+            cmd = ["claude", "-p", "--model", arg]; inp = prompt
+        elif kind == "codex":
+            cmd = ["codex", "exec", "-m", arg, "-"]; inp = prompt
+        elif kind == "cmd":
+            cmd = ["bash", "-c", arg]; inp = prompt
+        else: die("unknown reviewer spec %r" % spec, 2)
+        try:
+            r = subprocess.run(cmd, input=inp, capture_output=True, text=True, timeout=900, cwd=d)
+        except FileNotFoundError:
+            die("reviewer CLI not installed here: %s (CANNOT RUN HERE)" % cmd[0], 3)
+        return r.returncode, r.stdout, r.stderr
+
+def parse_review(raw):
+    txt = raw.strip()
+    try:
+        o = json.loads(txt)
+        if isinstance(o, dict) and "checklist" not in o:
+            for k in ("structuredOutput", "structured_output", "text", "result"):
+                if k in o:
+                    o = o[k] if isinstance(o[k], dict) else json.loads(o[k]); break
+    except Exception:
+        m = re.search(r"\{.*\}", txt, re.S)
+        if not m: return None
+        try: o = json.loads(m.group(0))
+        except Exception: return None
+    return o if isinstance(o, dict) else None
+
+HYGIENE_BLOCKING_FROM = os.environ.get("HYGIENE_BLOCKING_FROM", "1970-01-01")   # set a future date to warn-only during a rollout week
+def hygiene_blocking(): return now().date().isoformat() >= HYGIENE_BLOCKING_FROM
+def is_hyg(c): return str(c.get("item", "")).strip().lower().startswith("[hygiene]")
+def judge(o):
+    if o is None: return "FAIL", ["reviewer output is not parseable JSON"]
+    cl = o.get("checklist") or []; cm = o.get("comments") or []
+    why = []
+    if isinstance(cl, list) and not hygiene_blocking():
+        cl = [c for c in cl if not is_hyg(c)] or cl
+    if not isinstance(cl, list) or not cl: why.append("empty checklist (zero comments with an empty checklist is a FAIL)")
+    else:
+        bad = [c for c in cl if str(c.get("status", "")).upper() != "PASS"]
+        if bad: why.append("%d checklist item(s) not PASS" % len(bad))
+    blk = [c for c in cm if str(c.get("severity", "")).lower() == "blocking"]
+    if blk: why.append("%d blocking comment(s)" % len(blk))
+    return ("PASS" if not why else "FAIL"), why
+
+def same(a, b):
+    return (a.get("file") == b.get("file")) and difflib.SequenceMatcher(None, a.get("text", "").lower(), b.get("text", "").lower()).ratio() > 0.45
+
+def cmd_round(a):
+    bf, rf = family(a.builder_model), family(a.reviewer.partition(":")[2] or a.reviewer)
+    if a.reviewer.startswith("cmd:"): rf = a.reviewer_family
+    if not bf or not rf: die("cannot tell model family (builder %r -> %s, reviewer %r -> %s); pass a known model or --reviewer-family" % (a.builder_model, bf, a.reviewer, rf), 2)
+    if bf == rf:
+        if not (a.canary and a.same_family_ok):
+            die("reviewer family %s equals builder family %s; the reviewer must be a different family. Refused." % (rf, bf), 2)
+    if a.same_family_ok and not a.canary: die("--same-family-ok is only allowed with --canary", 2)
+    d = loopdir(a.lane, a.ref); prior = rounds(d)
+    if prior and (prior[-1].get("canary") != bool(a.canary)): die("loop dir mixes canary and real rounds", 2)
+    if len(prior) >= MAX_ROUNDS:
+        die("round cap reached (%d rounds). Open comments go to the lane PM; do not run a 4th round." % MAX_ROUNDS, 4)
+    if prior and prior[-1]["verdict"] == "PASS" and prior[-1]["head_sha"] == git(a.repo, "rev-parse", "HEAD"):
+        die("last round already PASSed on this head; nothing to re-review", 2)
+    head = git(a.repo, "rev-parse", "HEAD"); base = git(a.repo, "merge-base", a.base, "HEAD")
+    diff = git(a.repo, "diff", "--no-color", "%s...HEAD" % base, strip=False)
+    if not diff.strip(): die("empty diff %s...HEAD" % base, 2)
+    brief = open(a.brief).read()
+    if not brief.strip(): die("written brief is empty", 2)
+    prompt = PROMPT.replace("{brief}", brief).replace("{base}", base[:12]).replace("{head}", head[:12]).replace("{diff}", diff)
+    n = len(prior) + 1
+    rc, out, err = call_reviewer(a.reviewer, prompt)
+    o = parse_review(out) if rc == 0 else None
+    verdict, why = judge(o)
+    if rc != 0: why.insert(0, "reviewer exit %d: %s" % (rc, err[-200:]))
+    comments = (o or {}).get("comments") or []
+    try:
+        cc = subprocess.run([os.environ.get("COMMENT_CHECK_BIN", "comment-check"), "--repo", a.repo, "--base", base, "--json"], capture_output=True, text=True)
+        try: cc_find = json.loads(cc.stdout or "[]")
+        except ValueError: cc_find = [{"error": cc.stderr[-200:]}]
+    except FileNotFoundError: cc_find = []   # optional deterministic comment checker
+    hyg = [c for c in ((o or {}).get("checklist") or []) if is_hyg(c)]
+    hyg_status = (str(hyg[0].get("status", "")).upper() if hyg else "MISSING")
+    if (cc_find or hyg_status != "PASS"):
+        if hygiene_blocking():
+            if cc_find and verdict == "PASS": verdict = "FAIL"; why.append("comment-check: %d finding(s)" % len(cc_find))
+            if hyg_status == "MISSING" and verdict == "PASS": verdict = "FAIL"; why.append("reviewer omitted the [hygiene] checklist item")
+        else:
+            why.append("WARNING (non-blocking until %s): hygiene item %s, comment-check %d finding(s)" % (HYGIENE_BLOCKING_FROM, hyg_status, len(cc_find)))
+    resolved, still = [], []
+    for pc in (prior[-1].get("comments") if prior else []) or []:
+        (still if any(same(pc, c) for c in comments) else resolved).append(pc)
+    rawp = os.path.join(d, "round-%d.raw.txt" % n)
+    swrite(rawp, "=== PROMPT sha256 %s ===\n=== REVIEWER %s (family %s), builder %s (family %s) ===\n=== STDOUT ===\n%s\n=== STDERR ===\n%s\n" % (sha(prompt), a.reviewer, rf, a.builder_model, bf, out, err))
+    row = {"ts": now().isoformat(timespec="seconds"), "lane": a.lane, "ref": a.ref, "round": n, "head_sha": head, "base_sha": base,
+           "diff_sha256": sha(diff), "brief": os.path.abspath(a.brief), "brief_sha256": sha(brief), "reviewer": a.reviewer,
+           "reviewer_family": rf, "builder_model": a.builder_model, "builder_family": bf, "fresh_context": True, "full_diff": True,
+           "verdict": verdict, "why": why, "checklist": (o or {}).get("checklist") or [], "comments": comments,
+           "blocking_open": sum(str(c.get("severity", "")).lower() == "blocking" for c in comments),
+           "resolved_from_prev": len(resolved), "re_raised_from_prev": len(still), "raw": rawp, "canary": bool(a.canary),
+           "hygiene": {"reviewer_item": hyg_status, "comment_check": cc_find, "blocking": hygiene_blocking()}}
+    lp = os.path.join(d, "loop.jsonl")
+    old = open(lp).read() if os.path.isfile(lp) else ""
+    swrite(lp, old + json.dumps(row, ensure_ascii=False) + "\n")
+    print(json.dumps({k: row[k] for k in ("round", "verdict", "why", "blocking_open", "resolved_from_prev", "re_raised_from_prev", "head_sha", "raw")}))
+    if verdict != "PASS" and n >= MAX_ROUNDS:
+        print("review-loop: 3 rounds used with comments still open -> hand to the lane PM (no auto-merge).", file=sys.stderr); sys.exit(4)
+    sys.exit(0 if verdict == "PASS" else 1)
+
+def git(repo, *args, strip=True):
+    r = subprocess.run(["git", "-C", repo] + list(args), capture_output=True, text=True)
+    if r.returncode != 0: die("git %s failed: %s" % (" ".join(args), r.stderr.strip()), 3)
+    return r.stdout.strip() if strip else r.stdout
+
+def mergeable(lane, ref, head):
+    rs = rounds(loopdir(lane, ref))
+    if not rs: return False, "no review-loop rounds for %s %s" % (lane, ref)
+    last = rs[-1]
+    if last.get("canary"): return False, "loop is a canary run; never valid for a ship"
+    if last["reviewer_family"] == last["builder_family"]: return False, "reviewer family equals builder family"
+    h, lh = (head or "").strip().lower(), last["head_sha"].lower()
+    if len(h) < 7 or not lh.startswith(h):
+        return False, "last review round is on %s, not the PR head %s; run a fresh round on the final commit" % (lh[:12], head)
+    if last["verdict"] != "PASS": return False, "last round (%d) is FAIL: %s" % (last["round"], "; ".join(last["why"]))
+    if not last.get("checklist"): return False, "empty checklist"
+    return True, "round %d PASS on %s, %d checklist items, 0 blocking" % (last["round"], last["head_sha"][:12], len(last["checklist"]))
+
+ap = argparse.ArgumentParser(prog="review-loop"); sp = ap.add_subparsers(dest="cmd", required=True)
+r = sp.add_parser("round")
+for f in ("--lane", "--ref", "--repo", "--base", "--brief", "--builder-model", "--reviewer"): r.add_argument(f, required=True)
+r.add_argument("--reviewer-family"); r.add_argument("--canary", action="store_true"); r.add_argument("--same-family-ok", action="store_true")
+for name in ("status", "verdict"):
+    s = sp.add_parser(name); s.add_argument("--lane", required=True); s.add_argument("--ref", required=True); s.add_argument("--head-sha", required=(name == "verdict"))
+a = ap.parse_args()
+if any(t in " ".join(sys.argv[1:]).casefold() for t in RESTRICTED): die("restricted material is excluded", 2)
+if a.cmd == "round": cmd_round(a)
+elif a.cmd == "status":
+    for x in rounds(loopdir(a.lane, a.ref)):
+        print(json.dumps({k: x[k] for k in ("round", "ts", "head_sha", "verdict", "why", "blocking_open", "resolved_from_prev", "reviewer", "canary", "raw")}))
+    if a.head_sha: print(mergeable(a.lane, a.ref, a.head_sha)[1])
+else:
+    ok, msg = mergeable(a.lane, a.ref, a.head_sha); print(("MERGEABLE: " if ok else "NOT MERGEABLE: ") + msg); sys.exit(0 if ok else 1)

@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""ui-proof: recorded Playwright proof for a user-facing change, bound to the PR's final commit.
+
+  ui-proof record --lane L --ref PR --repo DIR --url BASE_URL --steps STEPS.json [--out DIR] [--headed]
+  ui-proof check  DIR --head-sha SHA          # exit 0 only if the proof is valid for that head
+
+STEPS.json: {"title": "...", "tests": [{"name": "It should ...", "steps": [
+   {"goto": "/path"}, {"click": "css or text=..."}, {"fill": ["selector", "value"]},
+   {"press": ["selector", "Enter"]}, {"expect_text": "text that must be visible"},
+   {"expect_url": "substring"}, {"expect_selector": "css"}]}]}
+Every expect_* is one assertion: passed / failed. A step that cannot run marks its test untested
+(with the reason), never skipped silently. Output (written through safe-write so ship-log can cite it):
+  video.webm, NN-<test>-<passed|failed>.png per assertion, assertions.md, manifest.json
+manifest.json carries commit = `git rev-parse HEAD` of --repo at record time, branch, url, the sha256 of
+every artifact, and the counts. check refuses when the commit is not the head SHA, any artifact is missing
+or its hash changed, there is no video, an assertion failed or is untested, or there are zero assertions.
+Never record secrets, tokens, customer data or payment details: such a flow must be marked untested.
+Exit: 0 ok, 1 proof invalid / an assertion failed, 2 usage/refused, 3 cannot run here."""
+import argparse, hashlib, json, os, re, subprocess, sys, datetime, shutil, tempfile
+SW = os.environ.get("SAFE_WRITE_BIN", "safe-write")
+HOME = os.environ.get("BOT_HOME", os.path.expanduser("~/bot-data"))
+ROOT = os.environ.get("UI_PROOF_ROOT", os.path.join(HOME, "ui-proof"))
+RESTRICTED = [t.strip().casefold() for t in os.environ.get("RESTRICTED_TERMS", "").split(",") if t.strip()]
+def die(m, c): print("ui-proof: " + m, file=sys.stderr); sys.exit(c)
+def h(p):
+    x = hashlib.sha256()
+    with open(p, "rb") as f:
+        for ch in iter(lambda: f.read(1 << 20), b""): x.update(ch)
+    return x.hexdigest()
+def swrite(path, data):
+    cur = subprocess.run([SW, "--sha", path], capture_output=True, text=True).stdout.strip().split()[-1]
+    r = subprocess.run([SW, path, "--expect-sha", cur, "--agent", os.environ.get("UI_PROOF_AGENT", "qa")], input=data, capture_output=True)
+    if r.returncode: die("safe-write failed for %s: %s" % (path, (r.stdout + r.stderr).decode()[-300:]), 3)
+def slug(s): return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:50]
+
+def record(a):
+    if any(t in (a.lane + a.ref + a.url).casefold() for t in RESTRICTED): die("restricted material is excluded", 2)
+    try: from playwright.sync_api import sync_playwright
+    except ImportError: die("python playwright not installed (CANNOT RUN HERE)", 3)
+    g = lambda *x: subprocess.run(["git", "-C", a.repo] + list(x), capture_output=True, text=True).stdout.strip()
+    commit = g("rev-parse", "HEAD")
+    if not re.fullmatch(r"[0-9a-f]{40}", commit): die("cannot read HEAD of %s" % a.repo, 3)
+    dirty = g("status", "--porcelain", "--untracked-files=no")
+    if dirty: die("worktree has uncommitted changes; proof must be of a committed head:\n" + dirty, 2)
+    spec = json.load(open(a.steps))
+    out = a.out or os.path.join(ROOT, "%s-%s" % (a.lane, re.sub(r"[^\w.-]", "_", a.ref)), commit[:12])
+    os.makedirs(out, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="uiproof-")
+    rows, n = [], 0
+    with sync_playwright() as p:
+        try: b = p.chromium.launch(headless=not a.headed, args=["--no-sandbox"])
+        except Exception: b = p.chromium.launch(channel="chrome", headless=not a.headed, args=["--no-sandbox"])
+        ctx = b.new_context(record_video_dir=tmp, viewport={"width": 1280, "height": 800})
+        pg = ctx.new_page()
+        for t in spec.get("tests", []):
+            rows.append(("test_start", t["name"], "", ""))
+            try:
+                for st in t["steps"]:
+                    k, v = next(iter(st.items()))
+                    if k == "goto": pg.goto(v if re.match(r"https?://|file:", v) else a.url.rstrip("/") + "/" + v.lstrip("/"), wait_until="networkidle")
+                    elif k == "click": pg.click(v)
+                    elif k == "fill": pg.fill(v[0], v[1])
+                    elif k == "press": pg.press(v[0], v[1])
+                    elif k.startswith("expect_"):
+                        n += 1
+                        try:
+                            if k == "expect_text": pg.get_by_text(v).first.wait_for(state="visible", timeout=5000); ok = True
+                            elif k == "expect_url": ok = v in pg.url
+                            elif k == "expect_selector": pg.wait_for_selector(v, timeout=5000); ok = True
+                            else: raise ValueError("unknown step " + k)
+                        except Exception: ok = False
+                        res = "passed" if ok else "failed"
+                        shot = "%02d-%s-%s.png" % (n, slug(t["name"]), res)
+                        pg.wait_for_timeout(400); pg.screenshot(path=os.path.join(tmp, shot))
+                        rows.append(("assertion", "%s %s" % (k, v), res, shot))
+                    else: raise ValueError("unknown step " + k)
+                    pg.wait_for_timeout(300)
+            except Exception as e:
+                rows.append(("assertion", "test could not run: %s" % str(e)[:120], "untested", ""))
+        vid = pg.video.path(); ctx.close(); b.close()
+    files = {}
+    shutil.copy(vid, os.path.join(tmp, "video.webm"))
+    md = ["# UI proof: %s" % spec.get("title", a.ref), "", "- lane: %s  ref: %s" % (a.lane, a.ref), "- commit: %s  branch: %s" % (commit, g("branch", "--show-current")),
+          "- url: %s" % a.url, "- recorded: %s" % datetime.datetime.now().astimezone().isoformat(timespec="seconds"), "", "| type | message | result | capture |", "|---|---|---|---|"]
+    md += ["| %s | %s | %s | %s |" % r for r in rows]
+    open(os.path.join(tmp, "assertions.md"), "w").write("\n".join(md) + "\n")
+    for f in sorted(os.listdir(tmp)):
+        if f == "video.webm" or f.endswith(".png") or f == "assertions.md":
+            swrite(os.path.join(out, f), open(os.path.join(tmp, f), "rb").read()); files[f] = h(os.path.join(out, f))
+    asr = [r for r in rows if r[0] == "assertion"]
+    man = {"lane": a.lane, "ref": a.ref, "commit": commit, "url": a.url, "steps_file": os.path.abspath(a.steps), "files": files,
+           "assertions": len(asr), "passed": sum(r[2] == "passed" for r in asr), "failed": sum(r[2] == "failed" for r in asr),
+           "untested": sum(r[2] == "untested" for r in asr), "tool": "ui-proof (playwright chromium)", "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
+    swrite(os.path.join(out, "manifest.json"), json.dumps(man, indent=1).encode())
+    shutil.rmtree(tmp, ignore_errors=True)
+    print(json.dumps({"out": out, "commit": commit, "assertions": man["assertions"], "passed": man["passed"], "failed": man["failed"], "untested": man["untested"]}))
+    sys.exit(0 if man["assertions"] and man["passed"] == man["assertions"] else 1)
+
+def check(d, head):
+    mp = os.path.join(d, "manifest.json")
+    if not os.path.isfile(mp): return False, "no manifest.json in %s" % d
+    m = json.load(open(mp)); hd = (head or "").lower()
+    if len(hd) < 7 or not m.get("commit", "").startswith(hd): return False, "proof commit %s is not the PR head %s" % (m.get("commit", "")[:12], head)
+    if "video.webm" not in m.get("files", {}): return False, "no video in proof"
+    for f, s in m["files"].items():
+        p = os.path.join(d, f)
+        if not os.path.isfile(p): return False, "artifact missing: " + f
+        if h(p) != s: return False, "artifact changed after recording: " + f
+    if os.path.getsize(os.path.join(d, "video.webm")) < 1000: return False, "video is empty"
+    if not m.get("assertions"): return False, "zero assertions"
+    if m.get("failed") or m.get("untested"): return False, "%d failed, %d untested assertion(s)" % (m.get("failed", 0), m.get("untested", 0))
+    return True, "%d/%d assertions passed on %s" % (m["passed"], m["assertions"], m["commit"][:12])
+
+ap = argparse.ArgumentParser(prog="ui-proof"); sp = ap.add_subparsers(dest="cmd", required=True)
+r = sp.add_parser("record")
+for f in ("--lane", "--ref", "--repo", "--url", "--steps"): r.add_argument(f, required=True)
+r.add_argument("--out"); r.add_argument("--headed", action="store_true")
+c = sp.add_parser("check"); c.add_argument("dir"); c.add_argument("--head-sha", required=True)
+a = ap.parse_args()
+if a.cmd == "record": record(a)
+ok, msg = check(a.dir, a.head_sha); print(("VALID: " if ok else "INVALID: ") + msg); sys.exit(0 if ok else 1)

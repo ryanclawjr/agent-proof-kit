@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""safe-write: write a file only when --expect-sha matches its current bytes; back up the old file and log the change.
+
+  safe-write --sha PATH                                  # print sha256 (or "absent")
+  safe-write PATH --expect-sha SHA --agent NAME < content
+
+Every write appends {ts,path,old_sha,new_sha,backup,agent} to $SAFE_WRITE_ROOT/log.jsonl.
+Eval hook: if PATH is a skill or profile guarded by an eval set in $EVAL_DIR (its "skill_path", or any file in
+that skill's folder) and $SKILL_ROOTS contains PATH, the skill's must-refuse evals run after the write. Exit 3
+from run-evals (a must-not violated, or a case that could not run) rolls the write back and exits 6 (BLOCKED).
+Optional: $RESTRICTED_TERMS (comma-separated) refuses paths that contain any of those terms (exit 4).
+Exit: 0 ok, 1 error, 2 usage, 3 stale sha, 4 refused, 6 blocked by eval gate."""
+import argparse, difflib, fcntl, glob, hashlib, json, os, shutil, stat, subprocess, sys, tempfile
+from datetime import datetime
+HOME = os.environ.get("BOT_HOME", os.path.expanduser("~/bot-data"))
+ROOT = os.environ.get("SAFE_WRITE_ROOT", os.path.join(HOME, "change-backups"))
+EVAL_DIR = os.environ.get("EVAL_DIR", os.path.join(HOME, "evals"))
+SKILL_ROOTS = [p for p in os.environ.get("SKILL_ROOTS", "").split(":") if p]
+RUN_EVALS = os.environ.get("RUN_EVALS_BIN", "run-evals")
+RESTRICTED = [t.strip().casefold() for t in os.environ.get("RESTRICTED_TERMS", "").split(",") if t.strip()]
+
+def die(m, c): print(m, file=sys.stderr if c == 2 else sys.stdout); sys.exit(c)
+def sha_file(p):
+    if not os.path.isfile(p): return "absent"
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for ch in iter(lambda: f.read(1 << 20), b""): h.update(ch)
+    return h.hexdigest()
+def now(): return datetime.now().astimezone()
+def log(o):
+    os.makedirs(ROOT, exist_ok=True)
+    with open(os.path.join(ROOT, "log.jsonl"), "a", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_EX); f.write(json.dumps(o, ensure_ascii=False) + "\n"); fcntl.flock(f, fcntl.LOCK_UN)
+def backup(src, t):
+    d = os.path.join(ROOT, t.strftime("%Y-%m-%d")); os.makedirs(d, exist_ok=True)
+    dest = os.path.join(d, os.path.abspath(src).replace("/", "_") + "." + t.strftime("%H%M%S")); n = 2
+    base = dest
+    while os.path.exists(dest): dest = "%s-%d" % (base, n); n += 1
+    shutil.copy2(src, dest); return dest
+def atomic(path, data, mode):
+    d = os.path.dirname(path) or "."
+    if not os.path.isdir(d): die("safe-write: directory does not exist: %s" % d, 1)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".safe-write-")
+    try:
+        with os.fdopen(fd, "wb") as f: f.write(data); f.flush(); os.fsync(f.fileno())
+        os.chmod(tmp, stat.S_IMODE(mode) if mode else 0o644); os.replace(tmp, path)
+    except Exception:
+        if os.path.exists(tmp): os.unlink(tmp)
+        raise
+def guarded_skill(path):
+    if not any(path.startswith(os.path.abspath(r) + "/") for r in SKILL_ROOTS): return None
+    for spec in glob.glob(os.path.join(EVAL_DIR, "*.eval.json")):
+        try: sp = os.path.abspath(json.load(open(spec)).get("skill_path", ""))
+        except Exception: continue
+        if path == sp or path.startswith(os.path.dirname(sp) + "/"): return os.path.basename(spec)[:-10]
+    return None
+def eval_gate(path, bk, agent):
+    skill = guarded_skill(path)
+    if not skill: return
+    print("eval-gate: running must-refuse evals for %s ..." % skill, flush=True)
+    try:
+        r = subprocess.run([RUN_EVALS, skill, "--only-type", "must-refuse", "--jobs", "6"], capture_output=True, text=True,
+                           timeout=int(os.environ.get("SAFE_WRITE_EVAL_TIMEOUT", "900")))
+        rc, out = r.returncode, (r.stdout + r.stderr).strip()
+    except Exception as e: rc, out = 3, "eval run error: %s" % e   # an eval that cannot run counts as a fail
+    print(out)
+    if rc == 3:
+        if bk: shutil.copy2(bk, path)
+        else: os.unlink(path)
+        log({"ts": now().isoformat(timespec="seconds"), "path": path, "old_sha": "rolled-back", "new_sha": sha_file(path),
+             "backup": bk, "agent": agent, "eval_gate": "BLOCKED: must-refuse regression in %s" % skill})
+        die("safe-write: BLOCKED by eval-gate (%s must-refuse regression); write rolled back" % skill, 6)
+    print("eval-gate: %s must-refuse PASS" % skill)
+
+ap = argparse.ArgumentParser(prog="safe-write"); ap.add_argument("path"); ap.add_argument("--sha", action="store_true")
+ap.add_argument("--expect-sha"); ap.add_argument("--agent")
+a = ap.parse_args(); path = os.path.abspath(os.path.expanduser(a.path))
+if a.sha:
+    s = sha_file(path); print(s); sys.exit(1 if s == "absent" else 0)
+if not a.expect_sha: die("safe-write: --expect-sha is required", 2)
+if not (a.agent or "").strip(): die("safe-write: REFUSED: --agent NAME is required for writes", 2)
+if any(t in path.casefold() for t in RESTRICTED): die("safe-write: REFUSED: path matches a restricted term", 4)
+if os.path.isdir(path): die("safe-write: REFUSED: %s is a directory" % path, 1)
+data = sys.stdin.buffer.read(); old, new = sha_file(path), hashlib.sha256(data).hexdigest()
+if a.expect_sha.strip().lower() != old:
+    ob = open(path, "rb").read() if os.path.isfile(path) else b""
+    d = list(difflib.unified_diff(ob.decode("utf-8", "replace").splitlines(True), data.decode("utf-8", "replace").splitlines(True), "current", "new"))
+    sys.stdout.write("REFUSED: stale\nexpected: %s\ncurrent: %s\n%s" % (a.expect_sha, old, "".join(d[:40]))); sys.exit(3)
+t = now(); bk = backup(path, t) if os.path.isfile(path) else None
+mode = os.stat(path).st_mode if os.path.isfile(path) else None
+atomic(path, data, mode)
+log({"ts": t.isoformat(timespec="seconds"), "path": path, "old_sha": old, "new_sha": new, "backup": bk, "agent": a.agent.strip()})
+print("OK %s %s->%s%s" % (path, old, new, " no change" if old == new else ""))
+if old != new: eval_gate(path, bk, a.agent.strip())

@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""gate-clear: the ONLY sanctioned way to clear a paused lane. Appends a row to <gate-dir>/clears.jsonl, then removes
+<gate-dir>/<lane>.paused.
+
+  gate-clear <lane> --agent auditor --verdict-file FAIL_ROW --reaudit PASS_ROW [--approved-by <owner> --quote "exact words" --quote-ref REF]
+
+Rules: only the auditor clears. A REPEAT failure (lane cleared in the last 7 days, or paused 2+ times in 24h by
+the safe-write log) needs --approved-by plus --quote and --quote-ref. --reaudit must be FILE.jsonl#L<n> (or a file
+holding one JSON object) whose row has verdict == "PASS" exactly and lane == <lane>. Exit 2 = refused.
+Caller check (optional, simple): set GATE_CLEAR_USER to the OS user the auditor runs as; any other user is refused.
+This is a speed bump, not security: real enforcement is file permissions on the gate directory (only the auditor's
+user may write or delete in it)."""
+import argparse, datetime, getpass, hashlib, json, os, sys
+HOME = os.environ.get("BOT_HOME", os.path.expanduser("~/bot-data"))
+GATE = os.environ.get("SHIP_GATE", os.path.join(HOME, "ship-gate")); CLEARS = os.path.join(GATE, "clears.jsonl")
+SW_LOG = os.path.join(os.environ.get("SAFE_WRITE_ROOT", os.path.join(HOME, "change-backups")), "log.jsonl")
+now = datetime.datetime.now().astimezone()
+def rows(p):
+    try: return [json.loads(l) for l in open(p) if l.strip()]
+    except FileNotFoundError: return []
+def die(m): print("gate-clear: " + m, file=sys.stderr); sys.exit(2)
+ap = argparse.ArgumentParser(); ap.add_argument("lane"); ap.add_argument("--agent", required=True)
+ap.add_argument("--verdict-file", required=True); ap.add_argument("--reaudit", required=True)
+ap.add_argument("--approved-by"); ap.add_argument("--quote"); ap.add_argument("--quote-ref")
+a = ap.parse_args()
+if a.agent.strip().casefold() != "auditor": die("only the auditor may clear a pause")
+want_user = os.environ.get("GATE_CLEAR_USER", "").strip()
+if want_user and getpass.getuser() != want_user: die("caller %r is not the auditor user %r" % (getpass.getuser(), want_user))
+p = os.path.join(GATE, "%s.paused" % a.lane)
+if not os.path.exists(p): die("no pause file for lane %s" % a.lane)
+def audit_row(ref):
+    path, _, frag = ref.partition("#")
+    try:
+        if frag: line = open(path).read().splitlines()[int(frag.split()[0].lstrip("Ll").split("-")[0]) - 1]
+        else: line = open(path).read().strip()
+        row = json.loads(line)
+    except Exception as e: die("%s must point to one JSON audit row (FILE.jsonl#L<n>): %s" % (ref, e))
+    if not isinstance(row, dict): die("%s is not a JSON object" % ref)
+    return row, line
+vrow, _ = audit_row(a.verdict_file)
+ra, txt = audit_row(a.reaudit)
+if ra.get("verdict") != "PASS": die("re-audit verdict is %r, not exactly 'PASS' (never clear on NEEDS-FIX)" % ra.get("verdict"))
+if ra.get("lane") != a.lane: die("re-audit row is for lane %r, not %r" % (ra.get("lane"), a.lane))
+ts = lambda s: datetime.datetime.fromisoformat(s)
+recent_clear = any(c["lane"] == a.lane and now - ts(c["cleared_at"]) < datetime.timedelta(days=7) for c in rows(CLEARS))
+pauses = [r for r in rows(SW_LOG) if r.get("path", "").endswith("/%s.paused" % a.lane) and r.get("old_sha") == "absent" and now - ts(r["ts"]) < datetime.timedelta(hours=24)]
+if (recent_clear or len(pauses) >= 2) and not (a.approved_by and a.quote and a.quote_ref):
+    die("repeat failure: needs --approved-by <owner> --quote \"<exact words>\" --quote-ref <ref>")
+row = {"lane": a.lane, "paused_at": datetime.datetime.fromtimestamp(os.path.getmtime(p)).astimezone().isoformat(timespec="seconds"),
+       "cleared_at": now.isoformat(timespec="seconds"), "cleared_by": "auditor", "verdict_file": a.verdict_file,
+       "reaudit": a.reaudit, "reaudit_sha256": hashlib.sha256(txt.encode()).hexdigest(), "repeat": recent_clear or len(pauses) >= 2,
+       "approved_by": a.approved_by, "quote": a.quote, "quote_ref": a.quote_ref}
+with open(CLEARS, "a") as f: f.write(json.dumps(row) + "\n")
+os.unlink(p); print(json.dumps(row))

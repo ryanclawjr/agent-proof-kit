@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""audit-row: run the deterministic part of an audit on one ship-log row and log a JSON verdict row.
+
+  audit-row --line N [--merged-sha SHA] [--verify-cmd "CMD"] [--repo DIR] [--judge-model M] [--builder-model M]
+
+Checks (items from the audit-a-ship skill): 1 proof_commit == head_sha (== --merged-sha if given);
+3 your own re-run of --verify-cmd exits 0 (CANNOT-VERIFY if not given); 5 proof cites a PASS and a CI run;
+16 review-loop verdict for merges; 17 ui-proof check when the proof cites one. Items that need judgment
+(diff vs brief, claims vs evidence, transcript) are left CANNOT-VERIFY for the bot to finish.
+Writes one row to $AUDIT_LOG_DIR/YYYY-MM-DD.jsonl through safe-write and prints its FILE#L<n> ref.
+SHADOW (default, AUDIT_MODE unset or "shadow"): never pauses. AUDIT_MODE=live: an overall FAIL writes <gate>/<lane>.paused.
+Exit: 0 PASS, 1 FAIL / NEEDS-FIX / CANNOT-VERIFY, 2 usage."""
+import argparse, datetime, json, os, re, subprocess, sys
+HOME = os.environ.get("BOT_HOME", os.path.expanduser("~/bot-data"))
+SHIP_LOG = os.environ.get("SHIP_LOG", os.path.join(HOME, "ship-log.jsonl"))
+OUT = os.environ.get("AUDIT_LOG_DIR", os.path.join(HOME, "audit"))
+GATE = os.environ.get("SHIP_GATE", os.path.join(HOME, "ship-gate"))
+SW = os.environ.get("SAFE_WRITE_BIN", "safe-write"); RL = os.environ.get("REVIEW_LOOP_BIN", "review-loop"); UP = os.environ.get("UI_PROOF_BIN", "ui-proof")
+ORDER = {"PASS": 0, "NEEDS-FIX": 1, "CANNOT-VERIFY": 2, "FAIL": 3}
+ap = argparse.ArgumentParser(prog="audit-row"); ap.add_argument("--line", type=int, required=True); ap.add_argument("--merged-sha", default="")
+ap.add_argument("--verify-cmd", default=""); ap.add_argument("--repo", default="."); ap.add_argument("--judge-model", default=""); ap.add_argument("--builder-model", default="")
+a = ap.parse_args()
+try: row = json.loads(open(SHIP_LOG).read().splitlines()[a.line - 1])
+except Exception as e: sys.exit("audit-row: cannot read ship-log line %d of %s: %s" % (a.line, SHIP_LOG, e))
+items = []
+def item(n, status, artifact, note=""): items.append({"n": n, "status": status, "artifact": artifact, "note": note})
+head, pc, merged = row.get("head_sha", ""), row.get("proof_commit", ""), a.merged_sha.lower()
+same = lambda x, y: len(x) >= 7 and len(y) >= 7 and (x.startswith(y) or y.startswith(x))
+ok1 = same(head, pc) and (not merged or same(merged, head))
+item(1, "PASS" if ok1 else "FAIL", "head_sha=%s proof_commit=%s merged=%s" % (head, pc, merged or "(not given)"))
+if a.verify_cmd:
+    r = subprocess.run(a.verify_cmd, shell=True, cwd=a.repo, capture_output=True, text=True)
+    item(3, "PASS" if r.returncode == 0 else "FAIL", "$ %s -> exit %d :: %s" % (a.verify_cmd, r.returncode, (r.stdout + r.stderr)[-300:]))
+else: item(3, "CANNOT-VERIFY", "no --verify-cmd given")
+pr = row.get("proof", "")
+item(5, "PASS" if ("PASS" in pr and (row.get("ci_run") or "/actions/runs/" in pr)) else "FAIL", "proof=%r ci_run=%r" % (pr[:200], row.get("ci_run")))
+if row.get("action") == "merge":
+    r = subprocess.run([RL, "verdict", "--lane", row["lane"], "--ref", row["ref"], "--head-sha", merged or head], capture_output=True, text=True)
+    item(16, "PASS" if r.returncode == 0 else "FAIL", (r.stdout + r.stderr).strip()[-300:])
+m = re.search(r"ui-proof (\S+)/manifest\.json", pr)
+if m:
+    r = subprocess.run([UP, "check", m.group(1), "--head-sha", merged or head], capture_output=True, text=True)
+    item(17, "PASS" if r.returncode == 0 else "FAIL", (r.stdout + r.stderr).strip()[-300:])
+for n, what in ((11, "claims vs evidence"), (12, "diff vs brief"), (14, "transcript")):
+    item(n, "CANNOT-VERIFY", "needs the bot's fresh-context review: " + what)
+hard = {1, 3, 5, 9, 10, 14, 16, 17}
+verdict = max((i["status"] for i in items), key=ORDER.get)
+if any(i["status"] == "FAIL" and i["n"] in hard for i in items): verdict = "FAIL"
+now = datetime.datetime.now().astimezone()
+out = {"ts": now.isoformat(timespec="seconds"), "lane": row.get("lane"), "ref": row.get("ref"), "merged_sha": merged or None, "verified_sha": head,
+       "verdict": verdict, "items": items, "judge_model": a.judge_model, "builder_model": a.builder_model, "fresh_context": True,
+       "overturn_run": False, "canary": bool(row.get("canary")), "mode": os.environ.get("AUDIT_MODE", "shadow"), "ship_log_line": a.line}
+os.makedirs(OUT, exist_ok=True); path = os.path.join(OUT, "%s.jsonl" % now.strftime("%Y-%m-%d"))
+old = open(path).read() if os.path.isfile(path) else ""
+cur = subprocess.run([SW, "--sha", path], capture_output=True, text=True).stdout.strip().split()[-1]
+r = subprocess.run([SW, path, "--expect-sha", cur, "--agent", "auditor"], input=(old + json.dumps(out) + "\n").encode(), capture_output=True)
+if r.returncode: sys.exit("audit-row: safe-write failed: " + (r.stdout + r.stderr).decode()[-300:])
+ref = "%s#L%d" % (path, len(old.splitlines()) + 1)
+print(json.dumps({"verdict": verdict, "ref": ref, "canary": out["canary"], "items": [(i["n"], i["status"]) for i in items]}))
+if verdict == "FAIL" and os.environ.get("AUDIT_MODE", "shadow") == "live":
+    pf = os.path.join(GATE, "%s.paused" % row.get("lane")); os.makedirs(GATE, exist_ok=True)
+    subprocess.run([SW, pf, "--expect-sha", "absent", "--agent", "auditor"], input=(ref + "\n").encode(), capture_output=True)
+    print("PAUSED lane %s (%s)" % (row.get("lane"), pf))
+sys.exit(0 if verdict == "PASS" else 1)

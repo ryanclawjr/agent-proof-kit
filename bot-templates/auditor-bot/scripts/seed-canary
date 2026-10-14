@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""seed-canary: append a known-bad ship-log row marked canary:true, so you can check that the auditor catches it.
+
+  seed-canary --lane <lane> [--kind sha-mismatch|bare-pass]
+
+sha-mismatch: proof_commit != head_sha (must FAIL item 1).  bare-pass: proof with no CI run (must FAIL item 5).
+This writes the row directly (bypassing ship-log, which would refuse it). Prints the ship-log line number.
+An audit of that line that does not come out FAIL means the auditor is broken: report it."""
+import argparse, datetime, json, os, secrets
+HOME = os.environ.get("BOT_HOME", os.path.expanduser("~/bot-data"))
+PATH = os.environ.get("SHIP_LOG", os.path.join(HOME, "ship-log.jsonl"))
+ap = argparse.ArgumentParser(); ap.add_argument("--lane", required=True); ap.add_argument("--kind", default="sha-mismatch", choices=["sha-mismatch", "bare-pass"])
+a = ap.parse_args(); h = secrets.token_hex(20)
+row = {"ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"), "lane": a.lane, "action": "push", "ref": "canary-" + h[:7],
+       "agent": "canary", "head_sha": h, "canary": True, "canary_kind": a.kind}
+if a.kind == "sha-mismatch": row.update(proof="verify PASS; CI https://ci.example/actions/runs/1", proof_commit=secrets.token_hex(20), ci_run="1")
+else: row.update(proof="PASS", proof_commit=h)
+os.makedirs(os.path.dirname(PATH) or ".", exist_ok=True)
+n = (len(open(PATH).read().splitlines()) if os.path.isfile(PATH) else 0) + 1
+with open(PATH, "a") as f: f.write(json.dumps(row) + "\n")
+print(json.dumps({"line": n, "kind": a.kind, "ship_log": PATH}))

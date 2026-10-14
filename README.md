@@ -128,6 +128,11 @@ export HOUSE_RULES="A named approver must say yes before anything is sent, spent
 | 6 | Run `bin/secret-scan` and `bin/isolation-lint`; fix or document every finding. Schedule `bin/nightly-checks`. | Both report 0; nightly JSON appears. |
 | 7 | Fill in `templates/proof-matrix.md` honestly: PROVEN / PARTIAL / NOT PROVEN, with the gap named. | Someone else can re-run every PROVEN row. |
 
+## Bot templates
+
+- [bot-templates/auditor-bot](bot-templates/auditor-bot): re-proves every ship from its evidence after it lands, pauses the lane on a FAIL, and only lets it resume after a passing re-audit and `gate-clear`.
+- [bot-templates/eval-keeper](bot-templates/eval-keeper): writes must-refuse and past-failure evals per skill, rolls back skill edits that break them, and re-tests skills with and without their text when the model changes.
+
 ## Limits (be honest about yours)
 
 - The mock judge is rule-based and only good enough to demo the pipeline. Use a real model.
