@@ -16,7 +16,8 @@ HOME = os.environ.get("BOT_HOME", os.path.expanduser("~/bot-data"))
 ROOT = os.environ.get("SAFE_WRITE_ROOT", os.path.join(HOME, "change-backups"))
 EVAL_DIR = os.environ.get("EVAL_DIR", os.path.join(HOME, "evals"))
 SKILL_ROOTS = [p for p in os.environ.get("SKILL_ROOTS", "").split(":") if p]
-RUN_EVALS = os.environ.get("RUN_EVALS_BIN", "run-evals")
+_sib = lambda n: (lambda p: p if os.path.exists(p) else n)(os.path.join(os.path.dirname(os.path.realpath(__file__)), n))  # sibling script, else PATH
+RUN_EVALS = (os.environ.get("RUN_EVALS_BIN") or _sib("run-evals"))
 RESTRICTED = [t.strip().casefold() for t in os.environ.get("RESTRICTED_TERMS", "").split(",") if t.strip()]
 
 def die(m, c): print(m, file=sys.stderr if c == 2 else sys.stdout); sys.exit(c)

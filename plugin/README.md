@@ -10,7 +10,13 @@ Try it offline (mock agent and mock judge, no API keys):
 ```bash
 scripts/run-evals evals/examples        # RESULT: PASS, planted bad answers caught 2/2
 scripts/judge-check evals/examples      # exit 0; JUDGE_CMD="scripts/mock-judge --lazy" -> exit 3
+
+export SHIP_LANES=web BOT_HOME=/tmp/apk-demo   # ship gate: lanes are required; BOT_HOME holds logs
+H=0123456789abcdef0123456789abcdef01234567
+scripts/ship-log --lane web --action push --ref $H --head-sha $H --proof-commit $H --proof "verify PASS" --dry-run   # exit 0, prints the row
+scripts/ship-log --lane web --action merge --ref 12 --head-sha $H --proof-commit $H --proof "verify PASS" --dry-run  # exit 9: no review-loop verdict
 ```
+Scripts call each other from `scripts/`; you don't need them on PATH (optional: `export PATH="$PWD/scripts:$PATH"`).
 
 ## Components
 | Kind | Name | What it does |

@@ -21,7 +21,8 @@ SW_LOG = os.path.join(os.environ.get("SAFE_WRITE_ROOT", os.path.join(HOME, "chan
 LEDGER = os.environ.get("MODEL_LEDGER", "")
 LANES = [l.strip() for l in os.environ.get("SHIP_LANES", "").split(",") if l.strip()]
 RESTRICTED = [t.strip().casefold() for t in os.environ.get("RESTRICTED_TERMS", "").split(",") if t.strip()]
-RL = os.environ.get("REVIEW_LOOP_BIN", "review-loop"); UP = os.environ.get("UI_PROOF_BIN", "ui-proof")
+_sib = lambda n: (lambda p: p if os.path.exists(p) else n)(os.path.join(os.path.dirname(os.path.realpath(__file__)), n))  # sibling script, else PATH
+RL = (os.environ.get("REVIEW_LOOP_BIN") or _sib("review-loop")); UP = (os.environ.get("UI_PROOF_BIN") or _sib("ui-proof"))
 RL_ROOT = os.environ.get("REVIEW_LOOP_ROOT", os.path.join(HOME, "review-loops"))
 
 def ref_pats(ref):

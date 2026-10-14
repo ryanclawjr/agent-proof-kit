@@ -27,7 +27,8 @@ import argparse, hashlib, json, os, re, subprocess, sys, tempfile, datetime, dif
 HOME = os.environ.get("BOT_HOME", os.path.expanduser("~/bot-data"))
 ROOT = os.environ.get("REVIEW_LOOP_ROOT", os.path.join(HOME, "review-loops"))
 RESTRICTED = [t.strip().casefold() for t in os.environ.get("RESTRICTED_TERMS", "").split(",") if t.strip()]
-SW = os.environ.get("SAFE_WRITE_BIN", "safe-write")
+_sib = lambda n: (lambda p: p if os.path.exists(p) else n)(os.path.join(os.path.dirname(os.path.realpath(__file__)), n))  # sibling script, else PATH
+SW = (os.environ.get("SAFE_WRITE_BIN") or _sib("safe-write"))
 GROK = os.environ.get("GROK_BIN", "grok")
 MAX_ROUNDS = 3
 NOTOOLS = "run_terminal_command,read_file,search_replace,list_dir,grep,kill_command_or_subagent,todo_write,get_command_or_subagent_output,spawn_subagent,scheduler_create,scheduler_delete,scheduler_list,monitor,search_tool,use_tool,workflow,enter_plan_mode,exit_plan_mode,ask_user_question,send_feedback,image_gen,image_edit,image_to_video,reference_to_video,write"

@@ -17,7 +17,8 @@ or its hash changed, there is no video, an assertion failed or is untested, or t
 Never record secrets, tokens, customer data or payment details: such a flow must be marked untested.
 Exit: 0 ok, 1 proof invalid / an assertion failed, 2 usage/refused, 3 cannot run here."""
 import argparse, hashlib, json, os, re, subprocess, sys, datetime, shutil, tempfile
-SW = os.environ.get("SAFE_WRITE_BIN", "safe-write")
+_sib = lambda n: (lambda p: p if os.path.exists(p) else n)(os.path.join(os.path.dirname(os.path.realpath(__file__)), n))  # sibling script, else PATH
+SW = (os.environ.get("SAFE_WRITE_BIN") or _sib("safe-write"))
 HOME = os.environ.get("BOT_HOME", os.path.expanduser("~/bot-data"))
 ROOT = os.environ.get("UI_PROOF_ROOT", os.path.join(HOME, "ui-proof"))
 RESTRICTED = [t.strip().casefold() for t in os.environ.get("RESTRICTED_TERMS", "").split(",") if t.strip()]

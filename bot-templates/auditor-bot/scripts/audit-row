@@ -15,7 +15,8 @@ HOME = os.environ.get("BOT_HOME", os.path.expanduser("~/bot-data"))
 SHIP_LOG = os.environ.get("SHIP_LOG", os.path.join(HOME, "ship-log.jsonl"))
 OUT = os.environ.get("AUDIT_LOG_DIR", os.path.join(HOME, "audit"))
 GATE = os.environ.get("SHIP_GATE", os.path.join(HOME, "ship-gate"))
-SW = os.environ.get("SAFE_WRITE_BIN", "safe-write"); RL = os.environ.get("REVIEW_LOOP_BIN", "review-loop"); UP = os.environ.get("UI_PROOF_BIN", "ui-proof")
+_sib = lambda n: (lambda p: p if os.path.exists(p) else n)(os.path.join(os.path.dirname(os.path.realpath(__file__)), n))  # sibling script, else PATH
+SW = (os.environ.get("SAFE_WRITE_BIN") or _sib("safe-write")); RL = (os.environ.get("REVIEW_LOOP_BIN") or _sib("review-loop")); UP = (os.environ.get("UI_PROOF_BIN") or _sib("ui-proof"))
 ORDER = {"PASS": 0, "NEEDS-FIX": 1, "CANNOT-VERIFY": 2, "FAIL": 3}
 ap = argparse.ArgumentParser(prog="audit-row"); ap.add_argument("--line", type=int, required=True); ap.add_argument("--merged-sha", default="")
 ap.add_argument("--verify-cmd", default=""); ap.add_argument("--repo", default="."); ap.add_argument("--judge-model", default=""); ap.add_argument("--builder-model", default="")
