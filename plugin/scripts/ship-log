@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""ship-log: append one push/deploy/merge record with its proof to the ship log (the auto-ship gate).
+
+  ship-log --lane <lane> --action push|deploy|merge --ref SHA_OR_PR --proof "<verify-cmd> PASS ...; CI <url>"
+           --head-sha SHA --proof-commit SHA [--agent NAME] [--user-facing --ui-proof DIR] [--ci-run ID] [--dry-run]
+
+Lanes come from $SHIP_LANES (comma-separated). Refusals:
+  5  <gate-dir>/<lane>.paused exists (Auditor FAIL pause; only gate-clear removes it)
+  6  $MODEL_LEDGER is set and has no entry for this lane citing the ref or written in the last 24h
+  7  --proof cites a local file that is missing or has no safe-write row matching its current sha256
+  8  --proof-commit != --head-sha, or --proof cites any other commit SHA (proof must come from the final commit)
+  9  --action merge and `review-loop verdict` does not exit 0
+  10 --user-facing and `ui-proof check DIR --head-sha HEAD` does not exit 0
+Warns (does not refuse) when the row carries no CI run id."""
+import argparse, fcntl, hashlib, json, os, re, subprocess, sys
+from datetime import datetime, timedelta
+HOME = os.environ.get("BOT_HOME", os.path.expanduser("~/bot-data"))
+PATH = os.environ.get("SHIP_LOG", os.path.join(HOME, "ship-log.jsonl"))
+GATE = os.environ.get("SHIP_GATE", os.path.join(HOME, "ship-gate"))
+SW_LOG = os.path.join(os.environ.get("SAFE_WRITE_ROOT", os.path.join(HOME, "change-backups")), "log.jsonl")
+LEDGER = os.environ.get("MODEL_LEDGER", "")
+LANES = [l.strip() for l in os.environ.get("SHIP_LANES", "").split(",") if l.strip()]
+RESTRICTED = [t.strip().casefold() for t in os.environ.get("RESTRICTED_TERMS", "").split(",") if t.strip()]
+RL = os.environ.get("REVIEW_LOOP_BIN", "review-loop"); UP = os.environ.get("UI_PROOF_BIN", "ui-proof")
+RL_ROOT = os.environ.get("REVIEW_LOOP_ROOT", os.path.join(HOME, "review-loops"))
+
+def ref_pats(ref):
+    r = (ref or "").strip(); pats = [re.escape(r)] if len(r) >= 4 else []
+    m = re.search(r"(\d+)\s*$", r)
+    if m and not re.fullmatch(r"[0-9a-fA-F]{7,40}", r): pats.append(r"(?:#|\bpr\s*#?|/pull/)%s\b" % m.group(1))
+    return [re.compile(x, re.I) for x in pats]
+
+def ledger_ok(lane, ref):
+    if not LEDGER: return True
+    if not os.path.isfile(LEDGER): return False
+    cutoff = datetime.now().astimezone() - timedelta(hours=24); pats = ref_pats(ref)
+    for line in open(LEDGER, encoding="utf-8", errors="replace"):
+        try: o = json.loads(line)
+        except ValueError: continue
+        if not isinstance(o, dict) or str(o.get("lane") or o.get("agent") or "").casefold() != lane: continue
+        text = " ".join(str(o.get(k) or "") for k in ("run", "task", "reason", "note", "ref"))
+        if any(p.search(text) for p in pats): return True
+        try:
+            dt = datetime.fromisoformat(str(o.get("ts", "")).replace("Z", "+00:00"))
+            if (dt if dt.tzinfo else dt.astimezone()) >= cutoff: return True
+        except ValueError: pass
+    return False
+
+def proof_problems(proof):
+    paths = []
+    for m in re.finditer(r"(?<![\w/.])(/[\w./@+~-]+)", proof or ""):
+        p = m.group(1).rstrip(".,;:)")
+        if (os.path.isabs(p) and p.count("/") > 1 and p not in paths and "/actions/runs/" not in p and "/pull/" not in p): paths.append(p)
+    rows = {}
+    if os.path.isfile(SW_LOG):
+        for line in open(SW_LOG, encoding="utf-8", errors="replace"):
+            try: o = json.loads(line)
+            except ValueError: continue
+            if isinstance(o, dict) and o.get("path") and o.get("new_sha"): rows.setdefault(os.path.realpath(o["path"]), set()).add(str(o["new_sha"]).lower())
+    out = []
+    for p in paths:
+        if os.path.isdir(p): continue
+        if not os.path.isfile(p): out.append((p, "file missing")); continue
+        h = hashlib.sha256(open(p, "rb").read()).hexdigest()
+        if h not in rows.get(os.path.realpath(p), set()): out.append((p, "no safe-write row with sha %s" % h[:12]))
+    return out
+
+ap = argparse.ArgumentParser(prog="ship-log")
+ap.add_argument("--lane", required=True); ap.add_argument("--action", required=True, choices=["push", "deploy", "merge"])
+ap.add_argument("--ref", required=True); ap.add_argument("--proof", required=True); ap.add_argument("--agent", default="")
+ap.add_argument("--head-sha", required=True); ap.add_argument("--proof-commit", required=True)
+ap.add_argument("--user-facing", action="store_true"); ap.add_argument("--ui-proof", default="")
+ap.add_argument("--ci-run", default=""); ap.add_argument("--dry-run", action="store_true")
+a = ap.parse_args()
+lane = a.lane.strip().casefold()
+if not LANES: sys.exit("ship-log: SHIP_LANES is not set. Set it to your lane names, comma-separated, e.g.\n  export SHIP_LANES=web,api\nA lane is one repo/deploy stream whose ships the auditor checks (and can pause).")
+if lane not in LANES: print("ship-log: unknown lane %r; known: %s" % (a.lane, ", ".join(LANES)), file=sys.stderr); sys.exit(2)
+paused = os.path.join(GATE, "%s.paused" % lane)
+if os.path.exists(paused):
+    print("ship-log: auto-ship paused for lane %s (%s). Fix the cited items and ask the auditor to re-audit; only gate-clear "
+          "removes the pause after a PASS." % (lane, paused), file=sys.stderr); sys.exit(5)
+if any(t in (a.ref + a.proof).casefold() for t in RESTRICTED): sys.exit("ship-log: restricted material is excluded from auto-ship")
+if "PASS" not in a.proof: sys.exit("ship-log: proof must cite a verify PASS; without it the gate is not met. Stop and ask.")
+head, pc = a.head_sha.strip().lower(), a.proof_commit.strip().lower()
+if not re.fullmatch(r"[0-9a-f]{7,40}", head): sys.exit("ship-log: --head-sha must be a git SHA (7-40 hex)")
+same = lambda x, y: len(x) >= 7 and len(y) >= 7 and (x.startswith(y) or y.startswith(x))
+if not same(pc, head):
+    print("ship-log: proof is from %s but the PR head is %s. Re-run verify and wait for CI on the head." % (pc[:12], head[:12]), file=sys.stderr); sys.exit(8)
+stale = sorted({t.lower() for t in re.findall(r"\b[0-9a-fA-F]{7,40}\b", a.proof) if re.search(r"[a-fA-F]", t) and not same(t.lower(), head)})
+if stale: print("ship-log: --proof cites commit(s) %s that are not the head %s." % (", ".join(stale), head[:12]), file=sys.stderr); sys.exit(8)
+extra = []
+if a.action == "merge":
+    r = subprocess.run([RL, "verdict", "--lane", lane, "--ref", a.ref, "--head-sha", head], capture_output=True, text=True)
+    if r.returncode != 0:
+        print("ship-log: review loop not passed: %s (max 3 rounds; still open -> lane PM; no auto-merge)" % (r.stdout + r.stderr).strip(), file=sys.stderr); sys.exit(9)
+    extra.append("review-loop " + os.path.join(RL_ROOT, "%s-%s" % (lane, re.sub(r"[^\w.-]", "_", a.ref)), "loop.jsonl"))
+if a.user_facing or a.ui_proof:
+    if not a.ui_proof: sys.exit("ship-log: --user-facing needs --ui-proof DIR")
+    r = subprocess.run([UP, "check", a.ui_proof, "--head-sha", head], capture_output=True, text=True)
+    if r.returncode != 0: print("ship-log: UI proof invalid: %s" % (r.stdout + r.stderr).strip(), file=sys.stderr); sys.exit(10)
+    extra.append("ui-proof " + os.path.join(a.ui_proof, "manifest.json"))
+if extra: a.proof += "; " + "; ".join(extra)
+bad = proof_problems(a.proof)
+if bad:
+    for p, why in bad: print("ship-log: %s: %s" % (p, why), file=sys.stderr)
+    print("Write each proof file through safe-write --agent <lane>, then re-run.", file=sys.stderr); sys.exit(7)
+if not ledger_ok(lane, a.ref):
+    print("ship-log: no model-run ledger entry in %s for lane %s citing %r or in the last 24h. Log the run or the skip (with a reason) first." % (LEDGER, lane, a.ref), file=sys.stderr); sys.exit(6)
+ci = a.ci_run.strip() or (re.search(r"/actions/runs/(\d+)", a.proof) or [None, ""])[1]
+if not ci: print("ship-log: WARNING: no CI run id; writing anyway", file=sys.stderr)
+o = {"ts": datetime.now().astimezone().isoformat(timespec="seconds"), "lane": lane, "action": a.action, "ref": a.ref,
+     "proof": a.proof, "agent": a.agent, "head_sha": head, "proof_commit": pc}
+if ci: o["ci_run"] = ci
+if a.dry_run: print("DRY RUN (not written): " + json.dumps(o)); sys.exit(0)
+os.makedirs(os.path.dirname(PATH) or ".", exist_ok=True)
+with open(PATH, "a+", encoding="utf-8") as f:
+    fcntl.flock(f, fcntl.LOCK_EX); f.seek(0); n = sum(1 for _ in f) + 1
+    f.write(json.dumps(o, ensure_ascii=False) + "\n"); fcntl.flock(f, fcntl.LOCK_UN)
+print(json.dumps(o))
+print("ship-log: wrote line %d of %s (audit it with: audit-row --line %d)" % (n, PATH, n), file=sys.stderr)

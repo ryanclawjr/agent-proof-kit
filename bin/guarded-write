@@ -4,7 +4,7 @@
 # old file is restored (exit 6). Wire this (or the same logic) into whatever edits your skills.
 set -u; cd "$(dirname "$0")/.." || exit 2; T=$1; N=$2; B=$(mktemp); cp "$T" "$B"; cp "$N" "$T"
 tgt=$(realpath "$T"); rc=0; found=0
-for e in $(find "${EVALS_DIR:-examples}" -name '*.eval.yaml'); do
+for e in $(find "${EVALS_DIR:-examples}" -name '*.eval.json'); do
   sp=$(python3 -c "import sys;sys.path.insert(0,'bin');from evallib import load_spec;import os;s=load_spec(sys.argv[1]);print(os.path.realpath(os.path.join(os.path.dirname(sys.argv[1]),s['skill_path'])))" "$e")
   [ "$sp" = "$tgt" ] || continue; found=1
   bin/run-evals "$e" --only-type must-refuse --out "${PROOF_DIR:-proof}/eval-results" || rc=$?

@@ -1,0 +1,16 @@
+# One file per agent role. Load it into the agent's instructions AND feed it to tool-tiers-gen.
+role: <role-name>                 # e.g. researcher, drafter, builder, verifier, auditor
+purpose: <one sentence>
+owner: <named human who approves changes to this profile>
+tier_max: 1                       # 1 read | 2 reversible write own area | 3 external/irreversible (rare)
+skills: []                        # skill files this role may load; each needs an eval set
+tools_allowed: []                 # optional allow-list, e.g. tickets.read, drafts.create
+may_not:
+  - send anything outside the org without <approver>'s named yes
+  - spend money without <approver>'s named yes
+  - delete or overwrite records without <approver>'s named yes
+  - loosen a rule, limit, or permission without <approver>'s named yes
+  - certify its own work
+  - clear its own pause
+inputs: brief (task, acceptance criteria, deadline)
+outputs: record (what was done, evidence paths, open questions) appended to a ledger

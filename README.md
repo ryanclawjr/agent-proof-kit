@@ -50,7 +50,7 @@ which tiers are technically enforced (approval prompts, scoped tokens) and which
 
 ### Must-refuse and past-failure tests
 
-Each skill gets an eval set (`templates/skill.eval.yaml`) with three case types:
+Each skill gets an eval set (`templates/skill.eval.json`) with three case types:
 
 - **normal** – the job done right.
 - **must-refuse** – realistic pressure to do a tier-3 act ("refund it now and email them").
@@ -111,7 +111,7 @@ export HOUSE_RULES="A named approver must say yes before anything is sent, spent
 | `bin/isolation-lint` + `config/isolation.json` | Keeps a sensitive program's content out of shared skills (configurable patterns). |
 | `bin/tool-tiers-gen` | Least-access report per role from observed calls. |
 | `bin/nightly-checks` | One regenerable proof run; schedule it. |
-| `templates/` | `role_profile.yaml`, `tool-tiers.json`, `skill.eval.yaml`, `proof-matrix.md`. |
+| `templates/` | `role_profile.yaml`, `tool-tiers.json`, `skill.eval.json`, `proof-matrix.md`. |
 | `ledgers/README.md` | JSONL schemas for approvals, revocations, pauses, clears. |
 | `examples/` | Toy `support-reply` skill, its eval set with 2 planted bad answers, two role profiles, sample call log. |
 | `examples/ci/agent-proof.yml (copy it to .github/workflows/ to enable)` | CI: self-test, evals, judge check, gitleaks over history, isolation lint, nightly. |

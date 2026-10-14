@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""judge-check <dir|file.eval.yaml>
+"""judge-check <dir|file.eval.json>
 Test the judge, not the agent. Feeds every `planted_bad_answers` entry straight to JUDGE_CMD.
 A judge that passes any planted bad answer is broken: exit 3. Run it whenever you change the
 judge command, model, or prompt, and nightly.
@@ -11,8 +11,10 @@ import importlib.machinery, importlib.util
 ld = importlib.machinery.SourceFileLoader("run_evals", os.path.join(HERE, "run-evals"))
 spec_ = importlib.util.spec_from_loader("run_evals", ld); re_ = importlib.util.module_from_spec(spec_); ld.exec_module(re_)
 a = sys.argv[1:]
-if not a: print(__doc__); sys.exit(2)
-t = a[0]; files = sorted(glob.glob(os.path.join(t, "**", "*.eval.yaml"), recursive=True)) if os.path.isdir(t) else [t]
+if not a or a[0] in ("-h", "--help"):
+    print("usage: judge-check <dir|file.eval.json>   (no eval set given; nothing was checked)\n" + __doc__, file=sys.stderr); sys.exit(2)
+t = a[0]; files = sorted(glob.glob(os.path.join(t, "**", "*.eval.json"), recursive=True)) if os.path.isdir(t) else [t]
+if not files: print(f"judge-check: no *.eval.json at {t}", file=sys.stderr); sys.exit(2)
 missed = total = 0
 for f in files:
     for c in load_spec(f)["cases"]:

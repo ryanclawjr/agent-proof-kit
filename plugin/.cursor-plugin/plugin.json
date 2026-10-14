@@ -1,0 +1,16 @@
+{
+  "name": "agent-proof-kit",
+  "displayName": "Agent Proof Kit",
+  "version": "0.1.0",
+  "description": "Make your agents prove it: ship-evidence gates, must-refuse and past-failure skill evals with a tested judge, and a fresh-context cross-model review loop before merge. Vendor-agnostic; runs offline with mocks.",
+  "author": { "name": "Ryan Johnson" },
+  "homepage": "https://github.com/ryanclawjr/agent-proof-kit",
+  "repository": "https://github.com/ryanclawjr/agent-proof-kit",
+  "license": "MIT",
+  "logo": "assets/logo.png",
+  "keywords": ["agent-proof-kit", "agents", "evals", "verification", "code-review", "shipping", "governance"],
+  "category": "developer-tools",
+  "tags": ["quality", "review", "evals", "audit"],
+  "skills": "./skills/",
+  "commands": "./commands/"
+}
