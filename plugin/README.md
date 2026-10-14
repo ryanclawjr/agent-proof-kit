@@ -11,7 +11,10 @@ Try it offline (mock agent and mock judge, no API keys):
 scripts/run-evals evals/examples        # RESULT: PASS, planted bad answers caught 2/2
 scripts/judge-check evals/examples      # exit 0; JUDGE_CMD="scripts/mock-judge --lazy" -> exit 3
 
-export SHIP_LANES=web BOT_HOME=/tmp/apk-demo   # ship gate: lanes are required; BOT_HOME holds logs
+# Required before any ship-log call: SHIP_LANES names the lanes (repo/deploy streams) the ship gate
+# accepts and the auditor checks; ship-log exits 1 if unset. Use a comma list for several, e.g. web,api.
+export SHIP_LANES=web
+export BOT_HOME=/tmp/apk-demo   # where ship-log writes its logs
 H=0123456789abcdef0123456789abcdef01234567
 scripts/ship-log --lane web --action push --ref $H --head-sha $H --proof-commit $H --proof "verify PASS" --dry-run   # exit 0, prints the row
 scripts/ship-log --lane web --action merge --ref 12 --head-sha $H --proof-commit $H --proof "verify PASS" --dry-run  # exit 9: no review-loop verdict
