@@ -1,0 +1,19 @@
+{
+  "name": "agent-proof-kit",
+  "owner": { "name": "Ryan Johnson" },
+  "metadata": {
+    "description": "Make your agents prove it: ship-evidence gates, must-refuse and past-failure skill evals with a tested judge, and a fresh-context cross-model review loop before merge. Vendor-agnostic; runs offline with mocks.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "agent-proof-kit",
+      "source": "./plugin",
+      "version": "0.1.0",
+      "description": "Make your agents prove it: ship-evidence gates, must-refuse and past-failure skill evals with a tested judge, and a fresh-context cross-model review loop before merge. Vendor-agnostic; runs offline with mocks.",
+      "keywords": ["agent-proof-kit", "agents", "evals", "verification", "code-review", "shipping", "governance"],
+      "category": "developer-tools",
+      "tags": ["quality", "review", "evals", "audit"]
+    }
+  ]
+}
